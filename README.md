@@ -72,6 +72,91 @@ Then type a task, e.g.:
 - "Read notes/todo.txt and summarize it."
 - "What is (17\*23) + 91?"
 
+## CLI commands (in-app)
+
+Once `python agent_cli.py` is running, you can use:
+
+- `/help`: show help
+- `/new`: start a fresh session (clears chat history)
+- `/auto`: enable automatic agent model selection
+- `/model`: show the currently forced/last-selected model
+- `/model <name>`: force a specific Ollama model (disables auto selection)
+- `/exit`: quit
+
+## Feature examples (copy/paste)
+
+All examples below are meant to be pasted into the running CLI prompt (`>`).
+
+### Math (deterministic fast-path for simple expressions)
+
+```text
+> what is (17*23) + 91?
+```
+
+```text
+> calculate 2^20
+```
+
+### Time (tool)
+
+```text
+> what time is it in UTC?
+```
+
+### List files (tool; restricted to this repo folder)
+
+```text
+> list files in this folder
+```
+
+```text
+> list files in notes
+```
+
+### Read a text file (tool; restricted to this repo folder)
+
+```text
+> read notes/todo.txt
+```
+
+### Write a text file (tool; restricted to this repo folder)
+
+```text
+> create a note file called notes/todo.txt with a 5-item todo list
+```
+
+### Append to a text file (tool; restricted to this repo folder)
+
+```text
+> append a new item "buy coffee filters" to notes/todo.txt
+```
+
+### Rate plan selection (tools)
+
+List available plans:
+
+```text
+> list available rate plans
+```
+
+Recommend cheapest plan for a 24-hour usage profile (24 numbers):
+
+```text
+> recommend the cheapest plan for this hourly usage profile: [0.8,0.7,0.6,0.6,0.5,0.5,0.6,0.9,1.2,1.4,1.6,1.7,1.8,1.7,1.6,1.5,1.4,1.6,1.8,1.7,1.4,1.2,1.0,0.9]
+```
+
+Same, but include solar generation (24 numbers):
+
+```text
+> recommend the cheapest plan for this usage profile: [0.8,0.7,0.6,0.6,0.5,0.5,0.6,0.9,1.2,1.4,1.6,1.7,1.8,1.7,1.6,1.5,1.4,1.6,1.8,1.7,1.4,1.2,1.0,0.9]. my solar hourly generation is: [0,0,0,0,0,0,0.1,0.3,0.6,0.9,1.1,1.2,1.3,1.2,1.0,0.7,0.4,0.2,0,0,0,0,0,0]
+```
+
+Estimate a daily bill for a specific plan:
+
+```text
+> estimate my daily bill for plan "tou-saver" with hourly usage: [0.8,0.7,0.6,0.6,0.5,0.5,0.6,0.9,1.2,1.4,1.6,1.7,1.8,1.7,1.6,1.5,1.4,1.6,1.8,1.7,1.4,1.2,1.0,0.9]
+```
+
 ## Notes
 
 - All filesystem tools are sandboxed to this repo directory (they can’t access outside paths).
@@ -131,6 +216,13 @@ export AGENT_TRACE_PATH=logs/agent_trace.jsonl
 python agent_cli.py
 ```
 
+To also see the selected model in the CLI:
+
+```bash
+export AGENT_DEBUG=1
+python agent_cli.py
+```
+
 ## Power grid rate-plan selection (example)
 
 List plans:
@@ -156,6 +248,12 @@ python eval_math500.py --limit 20
 python eval_math500.py
 ```
 
+Show the chosen model per question:
+
+```bash
+python eval_math500.py --limit 20 --show-model
+```
+
 Optional per-item JSONL log:
 
 ```bash
@@ -178,11 +276,7 @@ python gpu_energy_logger.py --duration 0 --interval 0.2 --efficient --save-plots
 
 ## Change log (what was updated)
 
-- Added DeepSeek-R1 routing tiers for MATH-500 including `deepseek-r1:32b`.
+- Added agent-owned model selection (`agent_selector.py`) using draft+judge for non-tool prompts and escalation for tool prompts.
+- Updated CLI (`agent_cli.py`) to use agent-driven selection (no router dependency) and added `AGENT_DEBUG`.
+- Updated MATH-500 eval (`eval_math500.py`) to run per-question agent selection and log decisions to `AGENT_TRACE_PATH`.
 - Improved MATH-500 prompt to enforce `\\boxed{...}` output.
-- Commented out cloud-model defaults in `env.sample` and documentation.
-- Added `ollama_utils.py` to share `ollama list` discovery with a TTL cache.
-- Router now selects **model + temperature + system prompt** per intent and supports tracing via `ROUTER_TRACE_PATH`.
-- Tool-agent loop now prefers native tool calling when available, with legacy fallback and repetition stopping.
-- `eval_math500.py` now logs per-item timing/model info and supports `--log-jsonl`.
-- Added optional GPU energy logger improvements (CSV flush, efficient mode, plots on Ctrl+C).
