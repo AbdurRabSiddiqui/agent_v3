@@ -1,0 +1,188 @@
+# LangChain + Ollama Basic Agent (Python)
+
+A minimal “agentic” AI that runs locally via **Ollama** and can carry out simple tasks using tools.
+
+## What it can do
+
+- Math via a calculator tool
+- Tell you the current time
+- List files in a directory (restricted to this project folder)
+- Read small text files (restricted to this project folder)
+- Write/append small text files (restricted to this project folder)
+- Estimate electric bills and recommend a rate plan (simple simulator)
+
+## Prerequisites
+
+- Python 3.10+ recommended
+- Ollama installed and running
+- Pull an Ollama model (example):
+
+```bash
+ollama pull deepseek-r1:8b
+ollama pull deepseek-r1:32b
+```
+
+List your installed local models (these names are what you put in `.env`):
+
+```bash
+ollama list
+```
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Create your env file:
+
+```bash
+cp env.sample .env
+```
+
+## Dependencies
+
+Python packages (from `requirements.txt`):
+
+- `langchain`
+- `langchain-core`
+- `langchain-community`
+- `langchain-ollama`
+- `pydantic`
+- `datasets`
+- `tqdm`
+- `sympy`
+- `python-dotenv`
+- `ipykernel`
+- `matplotlib`
+- `nvidia-ml-py` (optional, only for `gpu_energy_logger.py`)
+
+## Run
+
+```bash
+python agent_cli.py
+```
+
+Then type a task, e.g.:
+
+- "What files are in this folder?"
+- "Create a note file called notes/todo.txt with a 5-item todo list."
+- "Read notes/todo.txt and summarize it."
+- "What is (17\*23) + 91?"
+
+## Notes
+
+- All filesystem tools are sandboxed to this repo directory (they can’t access outside paths).
+- This setup is **Ollama-only** (no API keys needed). The agent picks between your local Ollama models (and can compare multiple) for speed vs quality.
+
+## How this folder works (high level)
+
+- `agent_cli.py`: interactive CLI entrypoint. Uses the agent’s model selector per user message, then either answers directly or uses the tool-agent loop.
+- `agent_selector.py`: agent-owned model selection. Compares 2–3 installed Ollama models (draft+judge) for non-tool prompts, and escalates tool-agent models on failures/stops. Writes selection traces to `AGENT_TRACE_PATH`.
+- `agent.py`: tool-agent loop. Prefers native tool-calling when the installed LangChain/Ollama stack supports it, and falls back to a strict JSON-blob protocol otherwise.
+- `tools.py`: general sandboxed tools (calculator, file read/write, etc.) + imports power tools.
+- `rate_tools.py`: deterministic “power plan” tools used by both the agent and the CLI fast-path.
+- `specialists.py`: deterministic fast-paths to avoid LLM calls when the request is safely solvable without a model.
+- `eval_math500.py`: evaluates the agent’s per-question model selection on MATH-500 (so you can inspect what it chose each item).
+- `ollama_utils.py`: shared `ollama list` discovery + TTL cache + model fallback.
+- `trace_utils.py`: JSONL trace helper used by agent/eval.
+- `gpu_energy_logger.py`: optional NVIDIA NVML power/energy logger (CSV + plots).
+
+## Model configuration (Ollama)
+
+The agent considers **all installed Ollama models** (from `ollama list`). The env vars below are only **preferences/defaults**:
+
+- `OLLAMA_TINY_MODEL`: fastest for short general Q&A (example: `phi3:mini`)
+- `OLLAMA_FAST_MODEL`: small, better quality than tiny (example: `gemma3:4b`)
+- `OLLAMA_GENERAL_MODEL`: default for most questions (example: `deepseek-r1:8b`)
+- `OLLAMA_TOOL_MODEL`: preferred when the tool-agent needs to plan/call tools (example: `deepseek-r1:8b`)
+- `OLLAMA_STRONG_MODEL`: used for hard math / complex requests (example: `deepseek-r1:32b`)
+- `OLLAMA_ULTRA_MODEL`: used for very long prompts (example: `deepseek-r1:32b`)
+
+Cloud examples (commented out / not used for local-only):
+
+- `# OLLAMA_STRONG_MODEL=deepseek-v3.1:671b-cloud`
+- `# OLLAMA_ULTRA_MODEL=gpt-oss:120b-cloud`
+
+Useful switches:
+
+- `AGENT_DEBUG=1`: prints which model was selected for each prompt (also accepts legacy `ROUTER_DEBUG=1`)
+- `MODEL_ALLOW_OLLAMA_CLOUD=1`: allows selecting `*-cloud` models from `ollama list` (some setups require `ollama login`)
+- `MODEL_LIST_TTL_S=5`: how long to cache `ollama list` results (seconds)
+- `MODEL_SELECT_CANDIDATES=3`: how many installed models to compare per prompt
+- `OLLAMA_JUDGE_MODEL`: optional judge model for draft+judge selection (defaults to largest installed)
+- `AGENT_TRACE_PATH=logs/agent_trace.jsonl`: write selection + tool-agent + eval traces (JSONL)
+- `AGENT_MAX_ITERATIONS=10`: tool-agent loop limit
+- `AGENT_MAX_HISTORY_MESSAGES=12`: truncate long chat histories
+
+## Tracing / observability (JSONL)
+
+This repo uses lightweight **JSONL** tracing (one JSON object per line) so you can record **selection decisions**, **tool calls**, and **final outputs/metadata** for debugging and evaluation.
+
+- **Enable tracing**: set `AGENT_TRACE_PATH` (example: `logs/agent_trace.jsonl`)
+- **Where it writes**: the file paths you set; parent directories are created automatically
+
+Example:
+
+```bash
+export AGENT_TRACE_PATH=logs/agent_trace.jsonl
+python agent_cli.py
+```
+
+## Power grid rate-plan selection (example)
+
+List plans:
+
+```bash
+python agent_cli.py
+```
+
+Then ask:
+
+- "List available rate plans."
+- "Recommend the cheapest plan for this hourly usage profile: [24 numbers...]."
+- "Same, but I have solar. My solar hourly generation is: [24 numbers...]."
+
+Plans live in `rate_plans.sample.json`. Replace it with your real utility tariff data.
+
+## Hugging Face MATH-500 evaluation
+
+This runs the agent’s per-question model selection (multi-model compare) against `HuggingFaceH4/MATH-500` and reports accuracy.
+
+```bash
+python eval_math500.py --limit 20
+python eval_math500.py
+```
+
+Optional per-item JSONL log:
+
+```bash
+python eval_math500.py --limit 50 --log-jsonl logs/math500.jsonl
+```
+
+## GPU power/energy logging (optional, NVIDIA)
+
+Record live GPU power/energy to a CSV and save plots at the end:
+
+```bash
+python gpu_energy_logger.py --duration 60 --efficient --save-plots --out-dir logs
+```
+
+Run until Ctrl+C (Jupyter/terminal) and still save plots:
+
+```bash
+python gpu_energy_logger.py --duration 0 --interval 0.2 --efficient --save-plots --out-dir logs
+```
+
+## Change log (what was updated)
+
+- Added DeepSeek-R1 routing tiers for MATH-500 including `deepseek-r1:32b`.
+- Improved MATH-500 prompt to enforce `\\boxed{...}` output.
+- Commented out cloud-model defaults in `env.sample` and documentation.
+- Added `ollama_utils.py` to share `ollama list` discovery with a TTL cache.
+- Router now selects **model + temperature + system prompt** per intent and supports tracing via `ROUTER_TRACE_PATH`.
+- Tool-agent loop now prefers native tool calling when available, with legacy fallback and repetition stopping.
+- `eval_math500.py` now logs per-item timing/model info and supports `--log-jsonl`.
+- Added optional GPU energy logger improvements (CSV flush, efficient mode, plots on Ctrl+C).
