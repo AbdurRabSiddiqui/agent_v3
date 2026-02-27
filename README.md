@@ -274,6 +274,24 @@ Run until Ctrl+C (Jupyter/terminal) and still save plots:
 python gpu_energy_logger.py --duration 0 --interval 0.2 --efficient --save-plots --out-dir logs
 ```
 
+### What to run (live-labeled power trace per prompt)
+
+Start GPU logger first (live-labeled CSV + plots on stop):
+
+```bash
+python gpu_energy_logger.py --duration 0 --interval 0.2 --efficient \
+  --csv logs/gpu_energy.csv \
+  --label-path logs/power_label.json \
+  --save-plots --out-dir logs
+```
+
+In another terminal, run your agent workload (this writes `logs/power_label.json` live):
+
+```bash
+export AGENT_TRACE_PATH=logs/agent_trace.jsonl
+python eval_math500.py --limit 20 --show-model --log-jsonl logs/math500.jsonl
+```
+
 ## Change log (what was updated)
 
 - Added agent-owned model selection (`agent_selector.py`) using draft+judge for non-tool prompts and escalation for tool prompts.

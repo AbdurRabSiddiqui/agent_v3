@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import time
 import threading
 from dataclasses import dataclass
@@ -69,7 +70,8 @@ class GPUEnergyLogger:
     baseline_duration_s: float = 5.0,
     csv_path: Optional[str] = None,
     flush_csv: bool = True,
-    store_series: bool = True
+    store_series: bool = True,
+    label_path: Optional[str] = None
   ):
     _require_nvml()
     self.device_index = device_index
@@ -78,6 +80,10 @@ class GPUEnergyLogger:
     self.csv_path = csv_path
     self.flush_csv = flush_csv
     self.store_series = bool(store_series)
+    self.label_path = (label_path or '').strip() or None
+
+    self._label_mtime: float = 0.0
+    self._label_cache: dict = {}
 
     self._running = False
     self._thread: Optional[threading.Thread] = None
@@ -161,11 +167,15 @@ class GPUEnergyLogger:
         csv_file = open(self.csv_path, mode='w', newline='', buffering=1)
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
+          'unix_ts',
           'elapsed_s',
           'total_power_w',
           'effective_power_w',
           'total_energy_j',
-          'effective_energy_j'
+          'effective_energy_j',
+          'prompt_idx',
+          'phase',
+          'phase_model'
         ])
         if self.flush_csv:
           csv_file.flush()
@@ -200,13 +210,36 @@ class GPUEnergyLogger:
             self.total_energy_series.append(self._total_energy_j)
             self.effective_energy_series.append(self._effective_energy_j)
 
+        prompt_idx = ''
+        phase = ''
+        phase_model = ''
+        if self.label_path:
+          try:
+            p = Path(self.label_path)
+            st = p.stat()
+            if st.st_mtime > self._label_mtime:
+              self._label_mtime = st.st_mtime
+              raw = p.read_text(encoding='utf-8')
+              self._label_cache = json.loads(raw) if raw else {}
+          except Exception:
+            pass
+
+          if isinstance(self._label_cache, dict):
+            prompt_idx = str(self._label_cache.get('prompt_idx') or '')
+            phase = str(self._label_cache.get('phase') or '')
+            phase_model = str(self._label_cache.get('phase_model') or '')
+
         if csv_writer:
           csv_writer.writerow([
+            now,
             sample.elapsed_s,
             sample.total_power_w,
             sample.effective_power_w,
             sample.total_energy_j,
-            sample.effective_energy_j
+            sample.effective_energy_j,
+            prompt_idx,
+            phase,
+            phase_model
           ])
           if self.flush_csv:
             csv_file.flush()
@@ -297,20 +330,25 @@ def save_plots_from_csv(*, csv_path: str, out_dir: str, title_prefix: str = '') 
   if not csv_path:
     raise RuntimeError('csv_path is required')
 
+  unix_ts: list[float] = []
   ts: list[float] = []
   total_p: list[float] = []
   eff_p: list[float] = []
   total_e: list[float] = []
   eff_e: list[float] = []
+  prompt_idx: list[str] = []
 
   with open(csv_path, newline='') as f:
     reader = csv.DictReader(f)
     for row in reader:
+      if 'unix_ts' in row and row.get('unix_ts'):
+        unix_ts.append(float(row['unix_ts']))
       ts.append(float(row['elapsed_s']))
       total_p.append(float(row['total_power_w']))
       eff_p.append(float(row['effective_power_w']))
       total_e.append(float(row['total_energy_j']))
       eff_e.append(float(row['effective_energy_j']))
+      prompt_idx.append(str(row.get('prompt_idx') or '').strip())
 
   if not ts:
     raise RuntimeError('CSV has no samples; cannot plot.')
@@ -322,6 +360,20 @@ def save_plots_from_csv(*, csv_path: str, out_dir: str, title_prefix: str = '') 
   fig1, ax1 = plt.subplots(figsize=(10, 4))
   ax1.plot(ts, total_p, label='total_power_w')
   ax1.plot(ts, eff_p, label='effective_power_w')
+  # If prompt_idx exists, lightly shade per-prompt regions.
+  if any(prompt_idx):
+    current = None
+    seg_start = None
+    for i, idx in enumerate(prompt_idx):
+      if idx != current:
+        if current and seg_start is not None:
+          ax1.axvspan(ts[seg_start], ts[i - 1], alpha=0.06)
+          ax1.text(ts[seg_start], max(total_p) * 0.98, str(current), fontsize=7, va='top')
+        current = idx or None
+        seg_start = i
+    if current and seg_start is not None:
+      ax1.axvspan(ts[seg_start], ts[-1], alpha=0.06)
+      ax1.text(ts[seg_start], max(total_p) * 0.98, str(current), fontsize=7, va='top')
   ax1.set_xlabel('Time (s)')
   ax1.set_ylabel('Power (W)')
   ax1.set_title((title_prefix + ' ' if title_prefix else '') + 'GPU power vs time')
@@ -334,9 +386,205 @@ def save_plots_from_csv(*, csv_path: str, out_dir: str, title_prefix: str = '') 
   fig2, ax2 = plt.subplots(figsize=(10, 4))
   ax2.plot(ts, total_e, label='total_energy_j')
   ax2.plot(ts, eff_e, label='effective_energy_j')
+  if any(prompt_idx):
+    current = None
+    seg_start = None
+    for i, idx in enumerate(prompt_idx):
+      if idx != current:
+        if current and seg_start is not None:
+          ax2.axvspan(ts[seg_start], ts[i - 1], alpha=0.06)
+          ax2.text(ts[seg_start], max(total_e) * 0.98, str(current), fontsize=7, va='top')
+        current = idx or None
+        seg_start = i
+    if current and seg_start is not None:
+      ax2.axvspan(ts[seg_start], ts[-1], alpha=0.06)
+      ax2.text(ts[seg_start], max(total_e) * 0.98, str(current), fontsize=7, va='top')
   ax2.set_xlabel('Time (s)')
   ax2.set_ylabel('Energy (J)')
   ax2.set_title((title_prefix + ' ' if title_prefix else '') + 'GPU energy vs time')
+  ax2.grid(True, alpha=0.3)
+  ax2.legend()
+  fig2.tight_layout()
+  fig2.savefig(energy_png, dpi=180)
+  plt.close(fig2)
+
+  return power_png, energy_png
+
+
+def _iter_jsonl(path: str):
+  if not path:
+    return
+  try:
+    with open(path, 'r', encoding='utf-8') as f:
+      for line in f:
+        line = (line or '').strip()
+        if not line:
+          continue
+        try:
+          yield json.loads(line)
+        except Exception:
+          continue
+  except Exception:
+    return
+
+
+def write_labeled_csv_from_trace(*, gpu_csv_path: str, trace_jsonl_path: str, out_csv_path: str) -> str:
+  """
+  Create a derived CSV that adds prompt/phase labels to each GPU sample.
+  Requires GPU CSV to include unix_ts (this logger writes it).
+  Labels are inferred from agent trace events (agent.select.* and agent.run.*).
+  """
+  phases: list[dict] = []
+  for ev in _iter_jsonl(trace_jsonl_path):
+    if not isinstance(ev, dict):
+      continue
+    ts = ev.get('ts')
+    if not isinstance(ts, (int, float)):
+      continue
+    prompt_idx = ev.get('prompt_idx')
+    if not isinstance(prompt_idx, int):
+      continue
+
+    event = str(ev.get('event') or '')
+    phase = str(ev.get('phase') or '')
+    duration_ms = ev.get('duration_ms')
+    model = ev.get('model') or ev.get('judge_model') or ev.get('chosen_model') or ''
+    if isinstance(duration_ms, (int, float)) and duration_ms > 0:
+      start_ts = float(ts) - (float(duration_ms) / 1000.0)
+      phases.append({
+        'start_ts': start_ts,
+        'end_ts': float(ts),
+        'prompt_idx': int(prompt_idx),
+        'phase': phase or event,
+        'model': str(model or '')
+      })
+    elif event == 'agent.select.start':
+      phases.append({
+        'start_ts': float(ts),
+        'end_ts': float(ts),
+        'prompt_idx': int(prompt_idx),
+        'phase': 'select.start',
+        'model': ''
+      })
+
+  phases_sorted = sorted(phases, key=lambda x: (x['start_ts'], x['end_ts']))
+
+  def pick_label(sample_ts: float) -> tuple[Optional[int], str, str]:
+    hit = None
+    for p in phases_sorted:
+      if p['start_ts'] <= sample_ts <= p['end_ts']:
+        hit = p
+    if hit:
+      return hit['prompt_idx'], hit['phase'], hit.get('model', '')
+    return None, '', ''
+
+  Path(out_csv_path).parent.mkdir(parents=True, exist_ok=True)
+  with open(gpu_csv_path, newline='') as f_in, open(out_csv_path, 'w', newline='') as f_out:
+    reader = csv.DictReader(f_in)
+    fieldnames = list(reader.fieldnames or [])
+    for extra in ['prompt_idx', 'phase', 'phase_model']:
+      if extra not in fieldnames:
+        fieldnames.append(extra)
+    writer = csv.DictWriter(f_out, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in reader:
+      try:
+        sample_ts = float(row.get('unix_ts') or 0.0)
+      except Exception:
+        sample_ts = 0.0
+      idx, phase, model = pick_label(sample_ts)
+      row['prompt_idx'] = '' if idx is None else str(idx)
+      row['phase'] = phase
+      row['phase_model'] = model
+      writer.writerow(row)
+  return out_csv_path
+
+
+def annotate_plots_with_prompts(*, csv_path: str, trace_jsonl_path: str, out_dir: str, title_prefix: str = '') -> tuple[str, str]:
+  """
+  Save PNG plots like save_plots_from_csv, but shade regions for each prompt_idx based on trace.
+  """
+  try:
+    import matplotlib.pyplot as plt
+  except Exception as e:
+    raise RuntimeError('matplotlib is required for graphs. Install `matplotlib`.') from e
+
+  xs: list[float] = []
+  total_p: list[float] = []
+  eff_p: list[float] = []
+  total_e: list[float] = []
+  eff_e: list[float] = []
+  base_unix: Optional[float] = None
+
+  with open(csv_path, newline='') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+      if base_unix is None and row.get('unix_ts'):
+        base_unix = float(row['unix_ts'])
+      u = float(row.get('unix_ts') or 0.0)
+      x = (u - base_unix) if base_unix is not None else float(row['elapsed_s'])
+      xs.append(x)
+      total_p.append(float(row['total_power_w']))
+      eff_p.append(float(row['effective_power_w']))
+      total_e.append(float(row['total_energy_j']))
+      eff_e.append(float(row['effective_energy_j']))
+
+  if not xs:
+    raise RuntimeError('CSV has no samples; cannot plot.')
+
+  prompt_windows: dict[int, dict] = {}
+  for ev in _iter_jsonl(trace_jsonl_path):
+    if not isinstance(ev, dict):
+      continue
+    if ev.get('event') not in ('agent.select.start', 'agent.select.final'):
+      continue
+    ts = ev.get('ts')
+    idx = ev.get('prompt_idx')
+    if not isinstance(ts, (int, float)) or not isinstance(idx, int):
+      continue
+    w = prompt_windows.get(idx) or {}
+    if ev.get('event') == 'agent.select.start':
+      w['start_ts'] = float(ts)
+      w['preview'] = ev.get('prompt_preview', '')
+    else:
+      w['end_ts'] = float(ts)
+    prompt_windows[idx] = w
+
+  Path(out_dir).mkdir(parents=True, exist_ok=True)
+  power_png = str(Path(out_dir) / 'gpu_power_annotated.png')
+  energy_png = str(Path(out_dir) / 'gpu_energy_annotated.png')
+
+  def to_x(unix_ts_val: float) -> float:
+    if base_unix is None:
+      return unix_ts_val
+    return unix_ts_val - base_unix
+
+  fig1, ax1 = plt.subplots(figsize=(12, 4))
+  ax1.plot(xs, total_p, label='total_power_w')
+  ax1.plot(xs, eff_p, label='effective_power_w')
+  for idx, w in sorted(prompt_windows.items()):
+    if 'start_ts' in w and 'end_ts' in w:
+      ax1.axvspan(to_x(w['start_ts']), to_x(w['end_ts']), alpha=0.08)
+      ax1.text(to_x(w['start_ts']), max(total_p) * 0.98, str(idx), fontsize=7, va='top')
+  ax1.set_xlabel('Time (s)')
+  ax1.set_ylabel('Power (W)')
+  ax1.set_title((title_prefix + ' ' if title_prefix else '') + 'GPU power vs time (shaded per prompt)')
+  ax1.grid(True, alpha=0.3)
+  ax1.legend()
+  fig1.tight_layout()
+  fig1.savefig(power_png, dpi=180)
+  plt.close(fig1)
+
+  fig2, ax2 = plt.subplots(figsize=(12, 4))
+  ax2.plot(xs, total_e, label='total_energy_j')
+  ax2.plot(xs, eff_e, label='effective_energy_j')
+  for idx, w in sorted(prompt_windows.items()):
+    if 'start_ts' in w and 'end_ts' in w:
+      ax2.axvspan(to_x(w['start_ts']), to_x(w['end_ts']), alpha=0.08)
+      ax2.text(to_x(w['start_ts']), max(total_e) * 0.98, str(idx), fontsize=7, va='top')
+  ax2.set_xlabel('Time (s)')
+  ax2.set_ylabel('Energy (J)')
+  ax2.set_title((title_prefix + ' ' if title_prefix else '') + 'GPU energy vs time (shaded per prompt)')
   ax2.grid(True, alpha=0.3)
   ax2.legend()
   fig2.tight_layout()
@@ -411,6 +659,9 @@ def main() -> int:
   parser.add_argument('--no-baseline', action='store_true', help='Disable idle baseline subtraction')
   parser.add_argument('--duration', type=float, default=0.0, help='Run for N seconds (0 = until Ctrl+C / plot close)')
   parser.add_argument('--csv', default=None, help='CSV output path (default: logs/gpu_energy_<ts>.csv)')
+  parser.add_argument('--label-path', default='', help='Optional JSON file path for live prompt/phase labels (written by agent)')
+  parser.add_argument('--trace-jsonl', default='', help='Optional agent trace JSONL (to label CSV + annotate plots)')
+  parser.add_argument('--labeled-csv', default='', help='Optional output path for labeled GPU CSV')
   parser.add_argument('--live-plot', action='store_true', help='Show live graphs while recording')
   parser.add_argument('--save-plots', action='store_true', help='Save PNG graphs at end (into --out-dir)')
   parser.add_argument('--out-dir', default='logs', help='Directory for saved PNGs (default: logs)')
@@ -436,7 +687,8 @@ def main() -> int:
     sample_interval_s=args.interval,
     baseline_duration_s=0.0 if args.no_baseline else args.baseline,
     csv_path=csv_path,
-    store_series=store_series
+    store_series=store_series,
+    label_path=(args.label_path or None)
   )
 
   exit_code = 0
@@ -477,14 +729,26 @@ def main() -> int:
   finally:
     if args.save_plots:
       if args.efficient:
-        power_png, energy_png = save_plots_from_csv(
-          csv_path=csv_path,
-          out_dir=args.out_dir,
-          title_prefix=logger.device_name
-        )
+        if args.trace_jsonl:
+          power_png, energy_png = annotate_plots_with_prompts(
+            csv_path=csv_path,
+            trace_jsonl_path=args.trace_jsonl,
+            out_dir=args.out_dir,
+            title_prefix=logger.device_name
+          )
+        else:
+          power_png, energy_png = save_plots_from_csv(
+            csv_path=csv_path,
+            out_dir=args.out_dir,
+            title_prefix=logger.device_name
+          )
       else:
         power_png, energy_png = logger.save_plots(out_dir=args.out_dir, title_prefix=logger.device_name)
       print(f'[gpu] saved plots: "{power_png}", "{energy_png}"')
+    if args.trace_jsonl:
+      out_csv = args.labeled_csv or str(Path(args.out_dir) / 'gpu_energy_labeled.csv')
+      out_csv = write_labeled_csv_from_trace(gpu_csv_path=csv_path, trace_jsonl_path=args.trace_jsonl, out_csv_path=out_csv)
+      print(f'[gpu] wrote labeled csv: "{out_csv}"')
     logger.shutdown()
 
   return exit_code

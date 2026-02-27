@@ -13,7 +13,7 @@ from agent import build_agent_executor, build_llm
 from ollama_utils import env as _env
 from ollama_utils import get_installed_ollama_models, is_truthy
 from specialists import try_math_expression
-from trace_utils import append_jsonl
+from trace_utils import append_jsonl, prompt_fingerprint, write_json
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,25 @@ class SelectionResult:
   temperature: float
   system_prompt: str
   reason: str
+
+
+_PROMPT_COUNTER = 0
+
+
+def _power_label_path() -> str:
+  return os.environ.get('POWER_LABEL_PATH') or os.environ.get('AGENT_POWER_LABEL_PATH') or 'logs/power_label.json'
+
+
+def _set_power_label(*, prompt_idx: int, phase: str, model: str, prompt_text: str):
+  path = _power_label_path()
+  payload = {
+    'ts': time.time(),
+    'prompt_idx': int(prompt_idx),
+    'phase': str(phase or ''),
+    'phase_model': str(model or ''),
+    **prompt_fingerprint(prompt_text)
+  }
+  write_json(path, payload)
 
 
 def _parse_model_size_b(model: str) -> float:
@@ -250,9 +269,11 @@ def _judge_pick(user_input: str, drafts: List[Dict[str, Any]], *, judge_model: s
     *answers
   ])
 
+  start = time.time()
   llm = build_llm(model=judge_model, temperature=temperature)
   res = llm.invoke([SystemMessage(content='Return strict JSON only.'), HumanMessage(content=prompt)])
   raw = (getattr(res, 'content', None) or str(res)).strip()
+  duration_ms = int((time.time() - start) * 1000)
 
   parsed: Dict[str, Any] = {}
   try:
@@ -271,13 +292,19 @@ def _judge_pick(user_input: str, drafts: List[Dict[str, Any]], *, judge_model: s
     parsed['winner'] = 0
     parsed['reason'] = (parsed.get('reason') or 'invalid_judge_json_fallback').strip()
 
-  return {'raw': raw, 'parsed': parsed}
+  return {'raw': raw, 'parsed': parsed, 'duration_ms': duration_ms}
 
 
-def _trace(path: str, obj: Dict[str, Any]) -> None:
+def _trace(path: str, obj: Dict[str, Any], *, prompt_idx: Optional[int] = None, prompt_text: Optional[str] = None) -> None:
   if not path:
     return
-  append_jsonl(path, obj)
+  payload = dict(obj or {})
+  if prompt_idx is not None and 'prompt_idx' not in payload:
+    payload['prompt_idx'] = int(prompt_idx)
+  if prompt_text is not None and isinstance(payload, dict):
+    if 'prompt_preview' not in payload or 'prompt_sha256' not in payload:
+      payload.update(prompt_fingerprint(prompt_text))
+  append_jsonl(path, payload)
 
 
 def answer_with_selection(
@@ -297,16 +324,26 @@ def answer_with_selection(
   """
   trace_path = trace_path if trace_path is not None else os.environ.get('AGENT_TRACE_PATH', '')
   intent = classify_intent(user_input)
+  global _PROMPT_COUNTER
+  _PROMPT_COUNTER += 1
+  prompt_idx = _PROMPT_COUNTER
+  _set_power_label(prompt_idx=prompt_idx, phase='select.start', model='', prompt_text=user_input)
 
   if intent == 'math':
     fast = try_math_expression(user_input)
     if fast is not None:
+      _set_power_label(prompt_idx=prompt_idx, phase='fast_path', model='', prompt_text=user_input)
       _trace(trace_path, {
         'event': 'agent.select.fast_path',
         'intent': intent,
         'kind': 'math_expression',
         'model': None
-      })
+      }, prompt_idx=prompt_idx, prompt_text=user_input)
+      _trace(trace_path, {
+        'event': 'agent.select.final',
+        'model': None,
+        'output_chars': len(fast or '')
+      }, prompt_idx=prompt_idx, prompt_text=user_input)
       return fast, SelectionResult(model='', temperature=0.0, system_prompt='', reason='fast_path:math_expression')
 
   installed = get_installed_ollama_models(
@@ -320,13 +357,15 @@ def answer_with_selection(
       system_prompt=_select_system_prompt(intent, is_tool=_needs_tools(user_input)),
       reason='forced_model'
     )
+    _set_power_label(prompt_idx=prompt_idx, phase='forced', model=selected.model, prompt_text=user_input)
     _trace(trace_path, {
       'event': 'agent.select.forced',
       'intent': intent,
       'model': selected.model,
       'temperature': selected.temperature
-    })
-    output = _run_with_selected(user_input, chat_history, selected, trace_path=trace_path)
+    }, prompt_idx=prompt_idx, prompt_text=user_input)
+    output = _run_with_selected(user_input, chat_history, selected, trace_path=trace_path, prompt_idx=prompt_idx)
+    _trace(trace_path, {'event': 'agent.select.final', 'model': selected.model, 'output_chars': len(output or '')}, prompt_idx=prompt_idx, prompt_text=user_input)
     return output, selected
 
   k = int(selection_k or _env('MODEL_SELECT_CANDIDATES', '3') or '3')
@@ -339,23 +378,26 @@ def answer_with_selection(
     'installed': [{'name': m, 'size_b': _parse_model_size_b(m)} for m in installed],
     'candidates': candidates,
     'candidate_reasons': reasons
-  })
+  }, prompt_idx=prompt_idx, prompt_text=user_input)
 
   if _needs_tools(user_input):
     # Prefer smaller first, then larger: escalate on failure/stops.
     by_size = sorted(candidates, key=_parse_model_size_b)
     last_error = ''
     for m in by_size:
+      _set_power_label(prompt_idx=prompt_idx, phase='tools.attempt', model=m, prompt_text=user_input)
       selected = SelectionResult(
         model=m,
         temperature=_select_temperature(intent, is_tool=True),
         system_prompt=_select_system_prompt(intent, is_tool=True),
         reason='tools:attempt'
       )
-      _trace(trace_path, {'event': 'agent.select.tools.attempt', 'model': m})
-      out = _run_with_selected(user_input, chat_history, selected, trace_path=trace_path)
+      _trace(trace_path, {'event': 'agent.select.tools.attempt', 'model': m, 'phase': 'tools.attempt'}, prompt_idx=prompt_idx, prompt_text=user_input)
+      out = _run_with_selected(user_input, chat_history, selected, trace_path=trace_path, prompt_idx=prompt_idx)
       if out and 'Agent stopped due to iteration limit or time limit.' not in out and 'Agent stopped:' not in out:
-        _trace(trace_path, {'event': 'agent.select.tools.success', 'model': m, 'output_chars': len(out or '')})
+        _set_power_label(prompt_idx=prompt_idx, phase='final', model=m, prompt_text=user_input)
+        _trace(trace_path, {'event': 'agent.select.tools.success', 'model': m, 'output_chars': len(out or ''), 'phase': 'tools.success'}, prompt_idx=prompt_idx, prompt_text=user_input)
+        _trace(trace_path, {'event': 'agent.select.final', 'model': m, 'output_chars': len(out or '')}, prompt_idx=prompt_idx, prompt_text=user_input)
         return out, SelectionResult(
           model=m,
           temperature=selected.temperature,
@@ -363,10 +405,10 @@ def answer_with_selection(
           reason='tools:success'
         )
       last_error = out or last_error
-      _trace(trace_path, {'event': 'agent.select.tools.escalate', 'model': m, 'stop_output': (out or '')[:400]})
+      _trace(trace_path, {'event': 'agent.select.tools.escalate', 'model': m, 'stop_output': (out or '')[:400], 'phase': 'tools.escalate'}, prompt_idx=prompt_idx, prompt_text=user_input)
 
     # Fall back to a non-tool tournament if tools kept failing.
-    _trace(trace_path, {'event': 'agent.select.tools.fallback_to_qa', 'last': (last_error or '')[:400]})
+    _trace(trace_path, {'event': 'agent.select.tools.fallback_to_qa', 'last': (last_error or '')[:400], 'phase': 'tools.fallback_to_qa'}, prompt_idx=prompt_idx, prompt_text=user_input)
 
   # Non-tool: draft + judge.
   sys_prompt = _select_system_prompt(intent, is_tool=False)
@@ -374,7 +416,8 @@ def answer_with_selection(
 
   max_chars = int(_env('MODEL_SELECT_MAX_OUTPUT_CHARS', '2000') or '2000')
   drafts: List[Dict[str, Any]] = []
-  for m in candidates:
+  for i, m in enumerate(candidates):
+    _set_power_label(prompt_idx=prompt_idx, phase=f'draft_{i}', model=m, prompt_text=user_input)
     start = time.time()
     llm = build_llm(model=m, temperature=temp)
     messages: List[BaseMessage] = [SystemMessage(content=sys_prompt), *list(chat_history), HumanMessage(content=user_input)]
@@ -389,11 +432,16 @@ def answer_with_selection(
       'output_trunc': (text or '')[:max_chars]
     }
     drafts.append(draft)
-    _trace(trace_path, {'event': 'agent.select.draft', **{k: v for k, v in draft.items() if k != 'output'}})
+    _trace(trace_path, {
+      'event': 'agent.select.draft',
+      'phase': f'draft_{i}',
+      **{k: v for k, v in draft.items() if k != 'output'}
+    }, prompt_idx=prompt_idx, prompt_text=user_input)
 
   judge_model = _env('OLLAMA_JUDGE_MODEL', '') or _best_by_size(installed) or (candidates[0] if candidates else '')
   judge_temp = _clamp_temperature(_env('MODEL_SELECT_JUDGE_TEMP', '0.0'), 0.0)
 
+  _set_power_label(prompt_idx=prompt_idx, phase='judge', model=judge_model, prompt_text=user_input)
   judged = _judge_pick(user_input, drafts, judge_model=judge_model, temperature=judge_temp)
   parsed = judged.get('parsed') or {}
   winner = int(parsed.get('winner') or 0)
@@ -406,16 +454,19 @@ def answer_with_selection(
 
   _trace(trace_path, {
     'event': 'agent.select.judge',
+    'phase': 'judge',
     'judge_model': judge_model,
+    'duration_ms': int(judged.get('duration_ms') or 0),
     'judge_raw': (judged.get('raw') or '')[:max_chars],
     'judge_parsed': parsed,
     'winner': winner,
     'chosen_model': chosen_model,
     'reason': reason
-  })
+  }, prompt_idx=prompt_idx, prompt_text=user_input)
 
   output = (drafts[winner].get('output') or '').strip() if drafts else ''
-  _trace(trace_path, {'event': 'agent.select.final', 'model': chosen_model, 'output_chars': len(output or '')})
+  _set_power_label(prompt_idx=prompt_idx, phase='final', model=chosen_model, prompt_text=user_input)
+  _trace(trace_path, {'event': 'agent.select.final', 'model': chosen_model, 'output_chars': len(output or ''), 'phase': 'final'}, prompt_idx=prompt_idx, prompt_text=user_input)
   return output, SelectionResult(model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason=reason)
 
 
@@ -424,7 +475,8 @@ def _run_with_selected(
   chat_history: List[BaseMessage],
   selected: SelectionResult,
   *,
-  trace_path: str
+  trace_path: str,
+  prompt_idx: Optional[int] = None
 ) -> str:
   """
   If tools are needed, run the tool-agent loop. Otherwise call the chat model directly.
@@ -436,10 +488,11 @@ def _run_with_selected(
     out = (result.get('output', '') or '').strip()
     _trace(trace_path, {
       'event': 'agent.run.tools',
+      'phase': 'tools.run',
       'model': selected.model,
       'duration_ms': int((time.time() - start) * 1000),
       'output_chars': len(out or '')
-    })
+    }, prompt_idx=prompt_idx, prompt_text=user_input)
     return out
 
   llm = build_llm(model=selected.model, temperature=selected.temperature)
@@ -453,9 +506,10 @@ def _run_with_selected(
   out = (getattr(res, 'content', None) or str(res)).strip()
   _trace(trace_path, {
     'event': 'agent.run.chat',
+    'phase': 'chat.run',
     'model': selected.model,
     'duration_ms': int((time.time() - start) * 1000),
     'output_chars': len(out or '')
-  })
+  }, prompt_idx=prompt_idx, prompt_text=user_input)
   return out
 
