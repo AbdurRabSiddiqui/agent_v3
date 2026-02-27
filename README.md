@@ -296,6 +296,16 @@ export AGENT_TRACE_PATH=logs/agent_trace.jsonl
 python eval_math500.py --limit 20 --show-model --log-jsonl logs/math500.jsonl
 ```
 
+Stop the GPU logger:
+
+- If it’s running in the foreground, press **Ctrl+C** in that terminal. It will stop recording and still write the plots (because `--save-plots` is enabled).
+- If it’s running in the background, stop it with `kill -INT <pid>` (SIGINT), which is equivalent to Ctrl+C:
+
+```bash
+pgrep -af "python gpu_energy_logger.py"
+kill -INT <pid>
+```
+
 ## Change log (what was updated)
 
 - Added agent-owned model selection (`agent_selector.py`) using draft+judge for non-tool prompts and escalation for tool prompts.

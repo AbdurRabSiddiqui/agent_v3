@@ -257,6 +257,62 @@ def _invoke_tool_with_timeout(
   }
 
 
+def _requires_boxed(user_input: str) -> bool:
+  text = user_input or ''
+  return '\\boxed' in text or 'Output ONLY the final answer in the form' in text
+
+
+def _draft_format_score(user_input: str, answer: str) -> Tuple[int, int, int]:
+  """
+  Higher is better.
+  - If prompt requires boxed, prefer answers with \\boxed and with ONLY boxed.
+  - Otherwise prefer shorter answers (slight).
+  """
+  ans = (answer or '').strip()
+  if not _requires_boxed(user_input):
+    return (0, 0, -len(ans))
+
+  has_boxed = 1 if '\\boxed{' in ans else 0
+  only_boxed = 0
+  if has_boxed:
+    # allow whitespace/newlines around; require entire output be a single boxed expression
+    if re.fullmatch(r'\s*\\boxed\{[\s\S]*\}\s*', ans):
+      only_boxed = 1
+  return (has_boxed, only_boxed, -len(ans))
+
+
+def _pick_best_draft(user_input: str, drafts: List[Dict[str, Any]]) -> Dict[str, Any]:
+  if not drafts:
+    return {}
+  return sorted(
+    drafts,
+    key=lambda d: (_draft_format_score(user_input, str(d.get('output') or '')), _parse_model_size_b(str(d.get('model') or ''))),
+    reverse=True
+  )[0]
+
+
+def _try_parse_judge_json(raw: str) -> Optional[Dict[str, Any]]:
+  """
+  Parse judge output. Return dict only if it contains an int winner.
+  """
+  parsed: Dict[str, Any] = {}
+  try:
+    parsed = json.loads(raw)
+  except Exception:
+    m = re.search(r'({[\s\S]*})', raw or '')
+    if not m:
+      return None
+    try:
+      parsed = json.loads(m.group(1))
+    except Exception:
+      return None
+
+  winner = parsed.get('winner')
+  if not isinstance(winner, int):
+    return None
+  return parsed
+
+
 def _parse_model_size_b(model: str) -> float:
   if not model:
     return 0.0
@@ -468,33 +524,19 @@ def _build_judge_prompt(user_input: str, drafts: List[Dict[str, Any]]) -> str:
     '- Completeness (meets constraints)',
     '- Clarity and concision',
     '- No hallucinated tool results',
+    '- Strictly follow any output formatting constraints in the user request',
     '',
     'Return STRICT JSON only, with this schema:',
     '{"winner": <int>, "reason": "<short>", "scores": {"correctness": <0-10>, "completeness": <0-10>, "clarity": <0-10>}}',
+    'Rules:',
+    '- winner MUST be an integer index referring to one Answer_i.',
+    '- Output MUST be valid JSON only (no markdown, no prose).',
     '',
     f'User request:\n{user_input}',
     '',
     'Candidate answers:',
     *answers
   ])
-
-
-def _parse_judge_json(raw: str) -> Dict[str, Any]:
-  parsed: Dict[str, Any] = {}
-  try:
-    parsed = json.loads(raw)
-  except Exception:
-    m = re.search(r'({[\s\S]*})', raw)
-    if m:
-      try:
-        parsed = json.loads(m.group(1))
-      except Exception:
-        parsed = {}
-  winner = parsed.get('winner')
-  if not isinstance(winner, int):
-    parsed['winner'] = 0
-    parsed['reason'] = (parsed.get('reason') or 'invalid_judge_json_fallback').strip()
-  return parsed
 
 
 def _trace(path: str, obj: Dict[str, Any], *, prompt_idx: Optional[int] = None, prompt_text: Optional[str] = None) -> None:
@@ -596,7 +638,7 @@ def answer_with_selection(
       )
       _trace(trace_path, {'event': 'agent.select.tools.attempt', 'model': m, 'phase': 'tools.attempt'}, prompt_idx=prompt_idx, prompt_text=user_input)
       out = _run_with_selected(user_input, chat_history, selected, trace_path=trace_path, prompt_idx=prompt_idx)
-      if out and 'tool_timeout_after_' not in out and 'Agent stopped due to iteration limit or time limit.' not in out and 'Agent stopped:' not in out:
+      if out and 'Agent stopped due to iteration limit or time limit.' not in out and 'Agent stopped:' not in out:
         _set_power_label(prompt_idx=prompt_idx, phase='final', model=m, prompt_text=user_input)
         _trace(trace_path, {'event': 'agent.select.tools.success', 'model': m, 'output_chars': len(out or ''), 'phase': 'tools.success'}, prompt_idx=prompt_idx, prompt_text=user_input)
         _trace(trace_path, {'event': 'agent.select.final', 'model': m, 'output_chars': len(out or '')}, prompt_idx=prompt_idx, prompt_text=user_input)
@@ -707,13 +749,25 @@ def answer_with_selection(
       continue
 
     judged_raw = str(rj.get('text') or '').strip()
-    judged_parsed = _parse_judge_json(judged_raw)
+    parsed = _try_parse_judge_json(judged_raw)
+    if parsed is None:
+      _trace(trace_path, {
+        'event': 'agent.select.judge_failed',
+        'phase': 'judge',
+        'judge_model': jm,
+        'duration_ms': judged_duration_ms,
+        'timed_out': False,
+        'error': 'invalid_judge_json'
+      }, prompt_idx=prompt_idx, prompt_text=user_input)
+      continue
+
+    judged_parsed = parsed
     judged_model_used = jm
     break
 
   if not judged_model_used:
-    # No judge succeeded: pick the largest successful draft as a deterministic fallback.
-    best = sorted(drafts, key=lambda d: _parse_model_size_b(str(d.get('model') or '')), reverse=True)[0]
+    # No judge succeeded: pick the best draft by format/quality heuristic.
+    best = _pick_best_draft(user_input, drafts) or drafts[0]
     chosen_model = str(best.get('model') or '')
     output = str(best.get('output') or '').strip()
     _set_power_label(prompt_idx=prompt_idx, phase='final', model=chosen_model, prompt_text=user_input)
@@ -726,10 +780,10 @@ def answer_with_selection(
       'judge_parsed': {},
       'winner': 0,
       'chosen_model': chosen_model,
-      'reason': 'judge_all_failed_pick_largest'
+      'reason': 'judge_all_failed_pick_best_draft'
     }, prompt_idx=prompt_idx, prompt_text=user_input)
     _trace(trace_path, {'event': 'agent.select.final', 'model': chosen_model, 'output_chars': len(output or ''), 'phase': 'final'}, prompt_idx=prompt_idx, prompt_text=user_input)
-    return output, SelectionResult(model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason='judge_all_failed_pick_largest')
+    return output, SelectionResult(model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason='judge_all_failed_pick_best_draft')
 
   winner = int(judged_parsed.get('winner') or 0)
   if winner < 0 or winner >= len(drafts):
@@ -738,6 +792,27 @@ def answer_with_selection(
   chosen = drafts[winner]
   chosen_model = str(chosen.get('model') or '')
   reason = str(judged_parsed.get('reason') or 'judge_pick').strip()
+
+  # Guardrail: if formatting constraints exist (e.g., \\boxed) and judge chose a worse-formatted draft,
+  # override to the best formatted draft.
+  best = _pick_best_draft(user_input, drafts)
+  if best:
+    best_model = str(best.get('model') or '')
+    chosen_score = _draft_format_score(user_input, str(chosen.get('output') or ''))
+    best_score = _draft_format_score(user_input, str(best.get('output') or ''))
+    if best_score > chosen_score and best_model != chosen_model:
+      _trace(trace_path, {
+        'event': 'agent.select.override',
+        'phase': 'override',
+        'from_model': chosen_model,
+        'to_model': best_model,
+        'from_score': list(chosen_score),
+        'to_score': list(best_score),
+        'reason': 'format_guardrail'
+      }, prompt_idx=prompt_idx, prompt_text=user_input)
+      chosen = best
+      chosen_model = best_model
+      reason = (reason + ' | override:format_guardrail').strip()
 
   _trace(trace_path, {
     'event': 'agent.select.judge',
@@ -778,6 +853,13 @@ def _run_with_selected(
       timeout_s=timeout_s
     )
     out = str(r.get('text') or '').strip()
+    if not r.get('ok'):
+      # Ensure the outer loop reliably escalates on tool timeouts/hangs.
+      err = str(r.get('error') or 'tool_failed')
+      if r.get('timed_out'):
+        out = f'Agent stopped: {err}'
+      else:
+        out = f'Error: {err}'
     _trace(trace_path, {
       'event': 'agent.run.tools',
       'phase': 'tools.run',
