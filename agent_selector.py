@@ -4,10 +4,12 @@ import json
 import os
 import re
 import time
+import multiprocessing as mp
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from agent import build_agent_executor, build_llm
 from ollama_utils import env as _env
@@ -41,6 +43,218 @@ def _set_power_label(*, prompt_idx: int, phase: str, model: str, prompt_text: st
     **prompt_fingerprint(prompt_text)
   }
   write_json(path, payload)
+
+
+def _serialize_history(chat_history: List[BaseMessage]) -> list[dict]:
+  out: list[dict] = []
+  for m in list(chat_history or []):
+    content = getattr(m, 'content', None)
+    if not isinstance(content, str):
+      content = str(content)
+    role = (getattr(m, 'type', None) or m.__class__.__name__ or '').lower()
+    if 'human' in role:
+      kind = 'human'
+    elif 'ai' in role:
+      kind = 'ai'
+    elif 'system' in role:
+      kind = 'system'
+    else:
+      kind = 'other'
+    out.append({'kind': kind, 'content': content})
+  return out
+
+
+def _invoke_chat_worker(payload: dict, out_q):
+  """
+  Separate process worker so we can timeout/terminate safely if Ollama hangs.
+  Payload keys: model, temperature, system_prompt, history(list), user_input
+  """
+  try:
+    # Import inside worker for spawn safety.
+    from agent import build_llm as _build_llm  # type: ignore
+    from langchain_core.messages import SystemMessage as _SystemMessage  # type: ignore
+    from langchain_core.messages import HumanMessage as _HumanMessage  # type: ignore
+    from langchain_core.messages import AIMessage as _AIMessage  # type: ignore
+
+    model = str(payload.get('model') or '')
+    temperature = float(payload.get('temperature') or 0.2)
+    system_prompt = str(payload.get('system_prompt') or '')
+    history = payload.get('history') or []
+    user_input = str(payload.get('user_input') or '')
+
+    llm = _build_llm(model=model, temperature=temperature)
+    messages = [_SystemMessage(content=system_prompt)] if system_prompt else []
+    for h in history:
+      if not isinstance(h, dict):
+        continue
+      kind = str(h.get('kind') or '')
+      content = str(h.get('content') or '')
+      if kind == 'human':
+        messages.append(_HumanMessage(content=content))
+      elif kind == 'ai':
+        messages.append(_AIMessage(content=content))
+      elif kind == 'system':
+        messages.append(_SystemMessage(content=content))
+    messages.append(_HumanMessage(content=user_input))
+
+    res = llm.invoke(messages)
+    text = (getattr(res, 'content', None) or str(res)).strip()
+    out_q.put({'ok': True, 'text': text})
+  except Exception as err:
+    out_q.put({'ok': False, 'error': str(err), 'traceback': traceback.format_exc()})
+
+
+def _invoke_chat_with_timeout(
+  *,
+  model: str,
+  temperature: float,
+  system_prompt: str,
+  chat_history: List[BaseMessage],
+  user_input: str,
+  timeout_s: float
+) -> dict:
+  """
+  Returns dict: { ok, text, duration_ms, timed_out, error? }
+  """
+  start = time.time()
+  ctx = mp.get_context('spawn')
+  q = ctx.Queue(maxsize=1)
+  p = ctx.Process(
+    target=_invoke_chat_worker,
+    args=({
+      'model': model,
+      'temperature': temperature,
+      'system_prompt': system_prompt,
+      'history': _serialize_history(chat_history),
+      'user_input': user_input
+    }, q)
+  )
+  p.start()
+  p.join(timeout=max(float(timeout_s), 0.1))
+  if p.is_alive():
+    try:
+      p.terminate()
+    except Exception:
+      pass
+    p.join(timeout=2)
+    return {
+      'ok': False,
+      'timed_out': True,
+      'duration_ms': int((time.time() - start) * 1000),
+      'error': f'timeout_after_{timeout_s}s'
+    }
+  try:
+    msg = q.get_nowait()
+  except Exception:
+    msg = {'ok': False, 'error': 'no_result_from_worker'}
+  duration_ms = int((time.time() - start) * 1000)
+  if not isinstance(msg, dict) or not msg.get('ok'):
+    return {
+      'ok': False,
+      'timed_out': False,
+      'duration_ms': duration_ms,
+      'error': str((msg or {}).get('error') or 'invoke_failed')
+    }
+  return {
+    'ok': True,
+    'timed_out': False,
+    'duration_ms': duration_ms,
+    'text': str(msg.get('text') or '')
+  }
+
+
+def _invoke_tool_worker(payload: dict, out_q):
+  """
+  Separate process worker so we can timeout/terminate safely if the tool-agent hangs.
+  Payload keys: model, temperature, history(list), user_input
+  """
+  try:
+    from agent import build_agent_executor as _build_agent_executor  # type: ignore
+    from langchain_core.messages import HumanMessage as _HumanMessage  # type: ignore
+    from langchain_core.messages import AIMessage as _AIMessage  # type: ignore
+    from langchain_core.messages import SystemMessage as _SystemMessage  # type: ignore
+
+    model = str(payload.get('model') or '')
+    temperature = float(payload.get('temperature') or 0.2)
+    history = payload.get('history') or []
+    user_input = str(payload.get('user_input') or '')
+
+    chat_history: list = []
+    for h in history:
+      if not isinstance(h, dict):
+        continue
+      kind = str(h.get('kind') or '')
+      content = str(h.get('content') or '')
+      if kind == 'human':
+        chat_history.append(_HumanMessage(content=content))
+      elif kind == 'ai':
+        chat_history.append(_AIMessage(content=content))
+      elif kind == 'system':
+        chat_history.append(_SystemMessage(content=content))
+
+    executor = _build_agent_executor(model=model, temperature=temperature, verbose=False)
+    result = executor.invoke({'input': user_input, 'chat_history': chat_history})
+    out = (result.get('output', '') or '').strip()
+    out_q.put({'ok': True, 'text': out})
+  except Exception as err:
+    out_q.put({'ok': False, 'error': str(err), 'traceback': traceback.format_exc()})
+
+
+def _invoke_tool_with_timeout(
+  *,
+  model: str,
+  temperature: float,
+  chat_history: List[BaseMessage],
+  user_input: str,
+  timeout_s: float
+) -> dict:
+  """
+  Returns dict: { ok, text, duration_ms, timed_out, error? }
+  """
+  start = time.time()
+  ctx = mp.get_context('spawn')
+  q = ctx.Queue(maxsize=1)
+  p = ctx.Process(
+    target=_invoke_tool_worker,
+    args=({
+      'model': model,
+      'temperature': temperature,
+      'history': _serialize_history(chat_history),
+      'user_input': user_input
+    }, q)
+  )
+  p.start()
+  p.join(timeout=max(float(timeout_s), 0.1))
+  if p.is_alive():
+    try:
+      p.terminate()
+    except Exception:
+      pass
+    p.join(timeout=2)
+    return {
+      'ok': False,
+      'timed_out': True,
+      'duration_ms': int((time.time() - start) * 1000),
+      'error': f'tool_timeout_after_{timeout_s}s'
+    }
+  try:
+    msg = q.get_nowait()
+  except Exception:
+    msg = {'ok': False, 'error': 'no_result_from_tool_worker'}
+  duration_ms = int((time.time() - start) * 1000)
+  if not isinstance(msg, dict) or not msg.get('ok'):
+    return {
+      'ok': False,
+      'timed_out': False,
+      'duration_ms': duration_ms,
+      'error': str((msg or {}).get('error') or 'tool_invoke_failed')
+    }
+  return {
+    'ok': True,
+    'timed_out': False,
+    'duration_ms': duration_ms,
+    'text': str(msg.get('text') or '')
+  }
 
 
 def _parse_model_size_b(model: str) -> float:
@@ -240,17 +454,12 @@ def _pick_candidates(user_input: str, installed: List[str], *, k: int) -> Tuple[
   return picked[:max(int(k), 1)], reasons
 
 
-def _judge_pick(user_input: str, drafts: List[Dict[str, Any]], *, judge_model: str, temperature: float) -> Dict[str, Any]:
-  """
-  Ask a judge model to pick the best draft. Returns parsed JSON with winner index.
-  """
-  # Anonymize model names in the judge prompt.
+def _build_judge_prompt(user_input: str, drafts: List[Dict[str, Any]]) -> str:
   answers = []
   for idx, d in enumerate(drafts):
     text = (d.get('output') or '').strip()
     answers.append(f'Answer_{idx}:\n{text}')
-
-  prompt = '\n\n'.join([
+  return '\n\n'.join([
     'You are grading candidate answers from different local models.',
     'Pick the best answer for the user request.',
     '',
@@ -269,30 +478,23 @@ def _judge_pick(user_input: str, drafts: List[Dict[str, Any]], *, judge_model: s
     *answers
   ])
 
-  start = time.time()
-  llm = build_llm(model=judge_model, temperature=temperature)
-  res = llm.invoke([SystemMessage(content='Return strict JSON only.'), HumanMessage(content=prompt)])
-  raw = (getattr(res, 'content', None) or str(res)).strip()
-  duration_ms = int((time.time() - start) * 1000)
 
+def _parse_judge_json(raw: str) -> Dict[str, Any]:
   parsed: Dict[str, Any] = {}
   try:
     parsed = json.loads(raw)
   except Exception:
-    # last-resort: try to extract a JSON object from the text
     m = re.search(r'({[\s\S]*})', raw)
     if m:
       try:
         parsed = json.loads(m.group(1))
       except Exception:
         parsed = {}
-
   winner = parsed.get('winner')
   if not isinstance(winner, int):
     parsed['winner'] = 0
     parsed['reason'] = (parsed.get('reason') or 'invalid_judge_json_fallback').strip()
-
-  return {'raw': raw, 'parsed': parsed, 'duration_ms': duration_ms}
+  return parsed
 
 
 def _trace(path: str, obj: Dict[str, Any], *, prompt_idx: Optional[int] = None, prompt_text: Optional[str] = None) -> None:
@@ -394,7 +596,7 @@ def answer_with_selection(
       )
       _trace(trace_path, {'event': 'agent.select.tools.attempt', 'model': m, 'phase': 'tools.attempt'}, prompt_idx=prompt_idx, prompt_text=user_input)
       out = _run_with_selected(user_input, chat_history, selected, trace_path=trace_path, prompt_idx=prompt_idx)
-      if out and 'Agent stopped due to iteration limit or time limit.' not in out and 'Agent stopped:' not in out:
+      if out and 'tool_timeout_after_' not in out and 'Agent stopped due to iteration limit or time limit.' not in out and 'Agent stopped:' not in out:
         _set_power_label(prompt_idx=prompt_idx, phase='final', model=m, prompt_text=user_input)
         _trace(trace_path, {'event': 'agent.select.tools.success', 'model': m, 'output_chars': len(out or ''), 'phase': 'tools.success'}, prompt_idx=prompt_idx, prompt_text=user_input)
         _trace(trace_path, {'event': 'agent.select.final', 'model': m, 'output_chars': len(out or '')}, prompt_idx=prompt_idx, prompt_text=user_input)
@@ -416,17 +618,36 @@ def answer_with_selection(
 
   max_chars = int(_env('MODEL_SELECT_MAX_OUTPUT_CHARS', '2000') or '2000')
   drafts: List[Dict[str, Any]] = []
-  for i, m in enumerate(candidates):
+  # Always try drafting from smallest -> largest so progress happens even if a big model hangs.
+  draft_models = sorted(list(candidates), key=_parse_model_size_b)
+  draft_timeout_s = float(_env('MODEL_SELECT_DRAFT_TIMEOUT_S', '180') or '180')
+
+  for i, m in enumerate(draft_models):
     _set_power_label(prompt_idx=prompt_idx, phase=f'draft_{i}', model=m, prompt_text=user_input)
-    start = time.time()
-    llm = build_llm(model=m, temperature=temp)
-    messages: List[BaseMessage] = [SystemMessage(content=sys_prompt), *list(chat_history), HumanMessage(content=user_input)]
-    res = llm.invoke(messages)
-    text = (getattr(res, 'content', None) or str(res)).strip()
-    duration_ms = int((time.time() - start) * 1000)
+    _trace(trace_path, {'event': 'agent.select.draft_attempt', 'phase': f'draft_{i}', 'model': m}, prompt_idx=prompt_idx, prompt_text=user_input)
+    r = _invoke_chat_with_timeout(
+      model=m,
+      temperature=temp,
+      system_prompt=sys_prompt,
+      chat_history=list(chat_history),
+      user_input=user_input,
+      timeout_s=draft_timeout_s
+    )
+    if not r.get('ok'):
+      _trace(trace_path, {
+        'event': 'agent.select.draft_failed',
+        'phase': f'draft_{i}',
+        'model': m,
+        'duration_ms': int(r.get('duration_ms') or 0),
+        'timed_out': bool(r.get('timed_out')),
+        'error': str(r.get('error') or '')
+      }, prompt_idx=prompt_idx, prompt_text=user_input)
+      continue
+
+    text = str(r.get('text') or '').strip()
     draft = {
       'model': m,
-      'duration_ms': duration_ms,
+      'duration_ms': int(r.get('duration_ms') or 0),
       'output': text,
       'output_chars': len(text or ''),
       'output_trunc': (text or '')[:max_chars]
@@ -438,33 +659,99 @@ def answer_with_selection(
       **{k: v for k, v in draft.items() if k != 'output'}
     }, prompt_idx=prompt_idx, prompt_text=user_input)
 
-  judge_model = _env('OLLAMA_JUDGE_MODEL', '') or _best_by_size(installed) or (candidates[0] if candidates else '')
-  judge_temp = _clamp_temperature(_env('MODEL_SELECT_JUDGE_TEMP', '0.0'), 0.0)
+  if not drafts:
+    _set_power_label(prompt_idx=prompt_idx, phase='final', model='', prompt_text=user_input)
+    _trace(trace_path, {'event': 'agent.select.final', 'model': '', 'output_chars': 0, 'phase': 'final', 'reason': 'all_drafts_failed'}, prompt_idx=prompt_idx, prompt_text=user_input)
+    return '', SelectionResult(model='', temperature=temp, system_prompt=sys_prompt, reason='all_drafts_failed')
 
-  _set_power_label(prompt_idx=prompt_idx, phase='judge', model=judge_model, prompt_text=user_input)
-  judged = _judge_pick(user_input, drafts, judge_model=judge_model, temperature=judge_temp)
-  parsed = judged.get('parsed') or {}
-  winner = int(parsed.get('winner') or 0)
+  judge_temp = _clamp_temperature(_env('MODEL_SELECT_JUDGE_TEMP', '0.0'), 0.0)
+  judge_timeout_s = float(_env('MODEL_SELECT_JUDGE_TIMEOUT_S', '90') or '90')
+
+  # Judge failover: if the heaviest judge hangs, try the next-largest judge.
+  preferred_judge = (_env('OLLAMA_JUDGE_MODEL', '') or '').strip()
+  judge_pool = sorted(_filter_installed(list(installed or [])), key=_parse_model_size_b, reverse=True)
+  judge_models: List[str] = []
+  if preferred_judge:
+    judge_models.append(preferred_judge)
+  for jm in judge_pool:
+    if jm not in judge_models:
+      judge_models.append(jm)
+
+  judge_prompt = _build_judge_prompt(user_input, drafts)
+  judged_raw = ''
+  judged_parsed: Dict[str, Any] = {}
+  judged_model_used = ''
+  judged_duration_ms = 0
+
+  for jm in judge_models[: max(len(judge_models), 1)]:
+    _set_power_label(prompt_idx=prompt_idx, phase='judge', model=jm, prompt_text=user_input)
+    _trace(trace_path, {'event': 'agent.select.judge_attempt', 'phase': 'judge', 'judge_model': jm}, prompt_idx=prompt_idx, prompt_text=user_input)
+    rj = _invoke_chat_with_timeout(
+      model=jm,
+      temperature=judge_temp,
+      system_prompt='Return strict JSON only.',
+      chat_history=[],
+      user_input=judge_prompt,
+      timeout_s=judge_timeout_s
+    )
+    judged_duration_ms = int(rj.get('duration_ms') or 0)
+    if not rj.get('ok'):
+      _trace(trace_path, {
+        'event': 'agent.select.judge_failed',
+        'phase': 'judge',
+        'judge_model': jm,
+        'duration_ms': judged_duration_ms,
+        'timed_out': bool(rj.get('timed_out')),
+        'error': str(rj.get('error') or '')
+      }, prompt_idx=prompt_idx, prompt_text=user_input)
+      continue
+
+    judged_raw = str(rj.get('text') or '').strip()
+    judged_parsed = _parse_judge_json(judged_raw)
+    judged_model_used = jm
+    break
+
+  if not judged_model_used:
+    # No judge succeeded: pick the largest successful draft as a deterministic fallback.
+    best = sorted(drafts, key=lambda d: _parse_model_size_b(str(d.get('model') or '')), reverse=True)[0]
+    chosen_model = str(best.get('model') or '')
+    output = str(best.get('output') or '').strip()
+    _set_power_label(prompt_idx=prompt_idx, phase='final', model=chosen_model, prompt_text=user_input)
+    _trace(trace_path, {
+      'event': 'agent.select.judge',
+      'phase': 'judge',
+      'judge_model': '',
+      'duration_ms': 0,
+      'judge_raw': '',
+      'judge_parsed': {},
+      'winner': 0,
+      'chosen_model': chosen_model,
+      'reason': 'judge_all_failed_pick_largest'
+    }, prompt_idx=prompt_idx, prompt_text=user_input)
+    _trace(trace_path, {'event': 'agent.select.final', 'model': chosen_model, 'output_chars': len(output or ''), 'phase': 'final'}, prompt_idx=prompt_idx, prompt_text=user_input)
+    return output, SelectionResult(model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason='judge_all_failed_pick_largest')
+
+  winner = int(judged_parsed.get('winner') or 0)
   if winner < 0 or winner >= len(drafts):
     winner = 0
 
-  chosen = drafts[winner] if drafts else {'model': candidates[0] if candidates else ''}
-  chosen_model = chosen.get('model') or (candidates[0] if candidates else '')
-  reason = str(parsed.get('reason') or 'judge_pick').strip()
+  chosen = drafts[winner]
+  chosen_model = str(chosen.get('model') or '')
+  reason = str(judged_parsed.get('reason') or 'judge_pick').strip()
 
   _trace(trace_path, {
     'event': 'agent.select.judge',
     'phase': 'judge',
-    'judge_model': judge_model,
-    'duration_ms': int(judged.get('duration_ms') or 0),
-    'judge_raw': (judged.get('raw') or '')[:max_chars],
-    'judge_parsed': parsed,
+    'judge_model': judged_model_used,
+    'duration_ms': judged_duration_ms,
+    'judge_raw': judged_raw[:max_chars],
+    'judge_parsed': judged_parsed,
     'winner': winner,
     'chosen_model': chosen_model,
     'reason': reason
   }, prompt_idx=prompt_idx, prompt_text=user_input)
 
-  output = (drafts[winner].get('output') or '').strip() if drafts else ''
+  output = str(chosen.get('output') or '').strip()
   _set_power_label(prompt_idx=prompt_idx, phase='final', model=chosen_model, prompt_text=user_input)
   _trace(trace_path, {'event': 'agent.select.final', 'model': chosen_model, 'output_chars': len(output or ''), 'phase': 'final'}, prompt_idx=prompt_idx, prompt_text=user_input)
   return output, SelectionResult(model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason=reason)
@@ -482,16 +769,24 @@ def _run_with_selected(
   If tools are needed, run the tool-agent loop. Otherwise call the chat model directly.
   """
   if _needs_tools(user_input):
-    executor = build_agent_executor(model=selected.model, temperature=selected.temperature, verbose=False)
-    start = time.time()
-    result = executor.invoke({'input': user_input, 'chat_history': chat_history})
-    out = (result.get('output', '') or '').strip()
+    timeout_s = float(_env('MODEL_SELECT_TOOL_TIMEOUT_S', '240') or '240')
+    r = _invoke_tool_with_timeout(
+      model=selected.model,
+      temperature=selected.temperature,
+      chat_history=list(chat_history),
+      user_input=user_input,
+      timeout_s=timeout_s
+    )
+    out = str(r.get('text') or '').strip()
     _trace(trace_path, {
       'event': 'agent.run.tools',
       'phase': 'tools.run',
       'model': selected.model,
-      'duration_ms': int((time.time() - start) * 1000),
-      'output_chars': len(out or '')
+      'duration_ms': int(r.get('duration_ms') or 0),
+      'timed_out': bool(r.get('timed_out')),
+      'ok': bool(r.get('ok')),
+      'output_chars': len(out or ''),
+      'error': str(r.get('error') or '')
     }, prompt_idx=prompt_idx, prompt_text=user_input)
     return out
 

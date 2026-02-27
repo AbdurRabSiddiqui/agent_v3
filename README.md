@@ -198,7 +198,11 @@ Useful switches:
 - `MODEL_LIST_TTL_S=5`: how long to cache `ollama list` results (seconds)
 - `MODEL_SELECT_CANDIDATES=3`: how many installed models to compare per prompt
 - `OLLAMA_JUDGE_MODEL`: optional judge model for draft+judge selection (defaults to largest installed)
+- `MODEL_SELECT_DRAFT_TIMEOUT_S`: per-draft timeout (seconds) so a hung model doesn’t block progress
+- `MODEL_SELECT_JUDGE_TIMEOUT_S`: per-judge timeout (seconds) with automatic judge failover
+- `MODEL_SELECT_TOOL_TIMEOUT_S`: per tool-agent attempt timeout (seconds) with escalation
 - `AGENT_TRACE_PATH=logs/agent_trace.jsonl`: write selection + tool-agent + eval traces (JSONL)
+- `POWER_LABEL_PATH=logs/power_label.json`: live JSON label file for GPU power logging
 - `AGENT_MAX_ITERATIONS=10`: tool-agent loop limit
 - `AGENT_MAX_HISTORY_MESSAGES=12`: truncate long chat histories
 
