@@ -263,6 +263,61 @@ def _requires_boxed(user_input: str) -> bool:
   return '\\boxed' in text or 'Output ONLY the final answer in the form' in text
 
 
+def _is_math500_prompt(user_input: str) -> bool:
+  text = user_input or ''
+  return 'MATH-500 competition problem' in text and _requires_boxed(text)
+
+
+def _extract_boxed_balanced(text: str) -> Optional[str]:
+  """
+  Extract the LAST \\boxed{...} content with balanced braces.
+  Returns the inner content (without \\boxed{ }).
+  """
+  if not text:
+    return None
+
+  last = (text or '').rfind('\\boxed{')
+  if last < 0:
+    return None
+
+  i = last + len('\\boxed{')
+  depth = 1
+  out = []
+  while i < len(text):
+    ch = text[i]
+    if ch == '{':
+      depth += 1
+      out.append(ch)
+    elif ch == '}':
+      depth -= 1
+      if depth == 0:
+        return ''.join(out).strip()
+      out.append(ch)
+    else:
+      out.append(ch)
+    i += 1
+
+  return None
+
+
+def _canonicalize_latex_math(expr: str) -> str:
+  s = str(expr or '')
+  s = s.replace('\\dfrac', '\\frac')
+  s = s.replace('\\left', '')
+  s = s.replace('\\right', '')
+  s = s.replace('\\,', '')
+  s = re.sub(r'\s+', '', s)
+  return s
+
+
+def _canonicalize_math500_answer(text: str) -> Optional[str]:
+  boxed = _extract_boxed_balanced(text or '')
+  if not boxed:
+    return None
+  inner = _canonicalize_latex_math(boxed)
+  return f'\\boxed{{{inner}}}'
+
+
 def _draft_format_score(user_input: str, answer: str) -> Tuple[int, int, int]:
   """
   Higher is better.
@@ -512,10 +567,23 @@ def _pick_candidates(user_input: str, installed: List[str], *, k: int) -> Tuple[
 
 
 def _build_judge_prompt(user_input: str, drafts: List[Dict[str, Any]]) -> str:
+  is_math500 = _is_math500_prompt(user_input)
   answers = []
   for idx, d in enumerate(drafts):
     text = (d.get('output') or '').strip()
-    answers.append(f'Answer_{idx}:\n{text}')
+    if is_math500:
+      answers.append(f'Answer_{idx} (model={str(d.get("model") or "")}):\n{text}')
+    else:
+      answers.append(f'Answer_{idx}:\n{text}')
+  notes = []
+  if is_math500:
+    notes = [
+      'Notes (MATH-500):',
+      '- Candidate answers are expected to already satisfy the output format constraint.',
+      '- Choose based on mathematical correctness/simplest exact form.',
+      '- If you are genuinely unsure between answers, prefer the one from the largest/most capable model.',
+      ''
+    ]
   return '\n\n'.join([
     'You are grading candidate answers from different local models.',
     'Pick the best answer for the user request.',
@@ -527,6 +595,7 @@ def _build_judge_prompt(user_input: str, drafts: List[Dict[str, Any]]) -> str:
     '- No hallucinated tool results',
     '- Strictly follow any output formatting constraints in the user request',
     '',
+    *notes,
     'Return STRICT JSON only, with this schema:',
     '{"winner": <int>, "reason": "<short>", "scores": {"correctness": <0-10>, "completeness": <0-10>, "clarity": <0-10>}}',
     'Rules:',
@@ -691,6 +760,19 @@ def answer_with_selection(
       continue
 
     text = str(r.get('text') or '').strip()
+    if _is_math500_prompt(user_input):
+      canon = _canonicalize_math500_answer(text)
+      if not canon:
+        _trace(trace_path, {
+          'event': 'agent.select.draft_failed',
+          'phase': f'draft_{i}',
+          'model': m,
+          'duration_ms': int(r.get('duration_ms') or 0),
+          'timed_out': False,
+          'error': 'missing_boxed'
+        }, prompt_idx=prompt_idx, prompt_text=user_input)
+        continue
+      text = canon
     draft = {
       'model': m,
       'duration_ms': int(r.get('duration_ms') or 0),

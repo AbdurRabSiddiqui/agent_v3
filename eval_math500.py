@@ -27,13 +27,41 @@ class EvalResult:
 
 
 def _extract_boxed(text: str) -> Optional[str]:
-  # common in MATH solutions: \boxed{...}
+  """
+  Extract the LAST \\boxed{...} content with balanced braces.
+  Returns the inner content (without \\boxed{ }).
+  """
   if not text:
     return None
-  matches = re.findall(r'\\boxed\{([^}]*)\}', text)
-  if matches:
-    return matches[-1].strip()
+  last = (text or '').rfind('\\boxed{')
+  if last < 0:
+    return None
+  i = last + len('\\boxed{')
+  depth = 1
+  out = []
+  while i < len(text):
+    ch = text[i]
+    if ch == '{':
+      depth += 1
+      out.append(ch)
+    elif ch == '}':
+      depth -= 1
+      if depth == 0:
+        return ''.join(out).strip()
+      out.append(ch)
+    else:
+      out.append(ch)
+    i += 1
   return None
+
+
+def _canonicalize_latex(s: str) -> str:
+  t = str(s or '')
+  t = t.replace('\\dfrac', '\\frac')
+  t = t.replace('\\left', '')
+  t = t.replace('\\right', '')
+  t = t.replace('\\,', '')
+  return t
 
 
 def _normalize_answer(s: str) -> str:
@@ -41,6 +69,7 @@ def _normalize_answer(s: str) -> str:
     return ''
   s = str(s).strip()
   s = s.replace('$', '')
+  s = _canonicalize_latex(s)
   s = re.sub(r'\s+', '', s)
   return s
 
@@ -51,9 +80,15 @@ def _compare(pred: str, gold: str) -> bool:
   if pred_n == gold_n:
     return True
 
-  # try boxed extraction from the model output
-  boxed = _extract_boxed(pred)
-  if boxed and _normalize_answer(boxed) == gold_n:
+  # Prefer comparing boxed inner expressions (canonicalized).
+  pred_boxed = _extract_boxed(pred)
+  gold_boxed = _extract_boxed(gold)
+  if pred_boxed and gold_boxed:
+    if _normalize_answer(pred_boxed) == _normalize_answer(gold_boxed):
+      return True
+
+  # Some gold answers are already unboxed; try pred boxed vs gold raw.
+  if pred_boxed and _normalize_answer(pred_boxed) == gold_n:
     return True
 
   # last-resort: try float comparison when both look numeric
