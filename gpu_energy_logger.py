@@ -288,6 +288,7 @@ class GPUEnergyLogger:
 
     power_png = str(Path(out_dir) / 'gpu_power.png')
     energy_png = str(Path(out_dir) / 'gpu_energy.png')
+    agent_power_png = str(Path(out_dir) / 'gpu_agent_power.png')
 
     fig1, ax1 = plt.subplots(figsize=(10, 4))
     ax1.plot(ts, total_p, label='total_power_w')
@@ -300,6 +301,17 @@ class GPUEnergyLogger:
     fig1.tight_layout()
     fig1.savefig(power_png, dpi=180)
     plt.close(fig1)
+
+    fig_agent, ax_agent = plt.subplots(figsize=(10, 4))
+    ax_agent.plot(ts, eff_p, label='effective_power_w', color='orange')
+    ax_agent.set_xlabel('Time (s)')
+    ax_agent.set_ylabel('Power (W)')
+    ax_agent.set_title((title_prefix + ' ' if title_prefix else '') + 'Agent power vs time')
+    ax_agent.grid(True, alpha=0.3)
+    ax_agent.legend()
+    fig_agent.tight_layout()
+    fig_agent.savefig(agent_power_png, dpi=180)
+    plt.close(fig_agent)
 
     fig2, ax2 = plt.subplots(figsize=(10, 4))
     ax2.plot(ts, total_e, label='total_energy_j')
@@ -356,6 +368,7 @@ def save_plots_from_csv(*, csv_path: str, out_dir: str, title_prefix: str = '') 
   Path(out_dir).mkdir(parents=True, exist_ok=True)
   power_png = str(Path(out_dir) / 'gpu_power.png')
   energy_png = str(Path(out_dir) / 'gpu_energy.png')
+  agent_power_png = str(Path(out_dir) / 'gpu_agent_power.png')
 
   fig1, ax1 = plt.subplots(figsize=(10, 4))
   ax1.plot(ts, total_p, label='total_power_w')
@@ -382,6 +395,30 @@ def save_plots_from_csv(*, csv_path: str, out_dir: str, title_prefix: str = '') 
   fig1.tight_layout()
   fig1.savefig(power_png, dpi=180)
   plt.close(fig1)
+
+  fig_agent, ax_agent = plt.subplots(figsize=(10, 4))
+  ax_agent.plot(ts, eff_p, label='effective_power_w', color='orange')
+  if any(prompt_idx):
+    current = None
+    seg_start = None
+    for i, idx in enumerate(prompt_idx):
+      if idx != current:
+        if current and seg_start is not None:
+          ax_agent.axvspan(ts[seg_start], ts[i - 1], alpha=0.06)
+          ax_agent.text(ts[seg_start], max(eff_p) * 0.98 if eff_p else 0.0, str(current), fontsize=7, va='top')
+        current = idx or None
+        seg_start = i
+    if current and seg_start is not None:
+      ax_agent.axvspan(ts[seg_start], ts[-1], alpha=0.06)
+      ax_agent.text(ts[seg_start], max(eff_p) * 0.98 if eff_p else 0.0, str(current), fontsize=7, va='top')
+  ax_agent.set_xlabel('Time (s)')
+  ax_agent.set_ylabel('Power (W)')
+  ax_agent.set_title((title_prefix + ' ' if title_prefix else '') + 'Agent power vs time')
+  ax_agent.grid(True, alpha=0.3)
+  ax_agent.legend()
+  fig_agent.tight_layout()
+  fig_agent.savefig(agent_power_png, dpi=180)
+  plt.close(fig_agent)
 
   fig2, ax2 = plt.subplots(figsize=(10, 4))
   ax2.plot(ts, total_e, label='total_energy_j')
@@ -552,6 +589,7 @@ def annotate_plots_with_prompts(*, csv_path: str, trace_jsonl_path: str, out_dir
 
   Path(out_dir).mkdir(parents=True, exist_ok=True)
   power_png = str(Path(out_dir) / 'gpu_power_annotated.png')
+  agent_power_png = str(Path(out_dir) / 'gpu_agent_power.png')
   energy_png = str(Path(out_dir) / 'gpu_energy_annotated.png')
 
   def to_x(unix_ts_val: float) -> float:
@@ -574,6 +612,21 @@ def annotate_plots_with_prompts(*, csv_path: str, trace_jsonl_path: str, out_dir
   fig1.tight_layout()
   fig1.savefig(power_png, dpi=180)
   plt.close(fig1)
+
+  fig_agent, ax_agent = plt.subplots(figsize=(12, 4))
+  ax_agent.plot(xs, eff_p, label='effective_power_w', color='orange')
+  for idx, w in sorted(prompt_windows.items()):
+    if 'start_ts' in w and 'end_ts' in w:
+      ax_agent.axvspan(to_x(w['start_ts']), to_x(w['end_ts']), alpha=0.08)
+      ax_agent.text(to_x(w['start_ts']), (max(eff_p) * 0.98) if eff_p else 0.0, str(idx), fontsize=7, va='top')
+  ax_agent.set_xlabel('Time (s)')
+  ax_agent.set_ylabel('Power (W)')
+  ax_agent.set_title((title_prefix + ' ' if title_prefix else '') + 'Agent power vs time (shaded per prompt)')
+  ax_agent.grid(True, alpha=0.3)
+  ax_agent.legend()
+  fig_agent.tight_layout()
+  fig_agent.savefig(agent_power_png, dpi=180)
+  plt.close(fig_agent)
 
   fig2, ax2 = plt.subplots(figsize=(12, 4))
   ax2.plot(xs, total_e, label='total_energy_j')

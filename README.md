@@ -306,6 +306,49 @@ pgrep -af "python gpu_energy_logger.py"
 kill -INT <pid>
 ```
 
+### Results (CSV + JSONL) with correctness + power per prompt
+
+After a benchmark run (e.g. MATH-500) and GPU logging, generate `logs/results.csv` and `logs/results.jsonl`:
+
+```bash
+python eval_report.py --benchmark math500 \
+  --eval-jsonl logs/math500.jsonl \
+  --agent-trace logs/agent_trace.jsonl \
+  --gpu-csv logs/gpu_energy.csv \
+  --out-csv logs/results.csv \
+  --out-jsonl logs/results.jsonl
+```
+
+Notes:
+
+- `eval_report.py` uses `logs/agent_trace.jsonl` to fill `selected_model`, `judge_model_used`, `timeouts_count`, and `retries_count`.
+- For long runs on A100, start from `env.sample` (it sets higher default timeouts for drafts/judge/tools).
+
+Power plots written by the GPU logger:
+
+- `logs/gpu_power.png` (total + effective)
+- `logs/gpu_agent_power.png` (orange only: effective power)
+- `logs/gpu_energy.png` (total + effective energy)
+
+### SWE-bench adapter (to JSONL)
+
+If your SWE-bench harness outputs a `.json` or `.jsonl` results file, convert it to the standard format this repo can aggregate:
+
+```bash
+python swebench_adapter.py --input /path/to/swebench_results.json --output logs/swebench.jsonl
+```
+
+Then generate results:
+
+```bash
+python eval_report.py --benchmark swebench \
+  --eval-jsonl logs/swebench.jsonl \
+  --agent-trace logs/agent_trace.jsonl \
+  --gpu-csv logs/gpu_energy.csv \
+  --out-csv logs/results.csv \
+  --out-jsonl logs/results.jsonl
+```
+
 ## Change log (what was updated)
 
 - Added agent-owned model selection (`agent_selector.py`) using draft+judge for non-tool prompts and escalation for tool prompts.

@@ -20,6 +20,7 @@ from trace_utils import append_jsonl, prompt_fingerprint, write_json
 
 @dataclass(frozen=True)
 class SelectionResult:
+  prompt_idx: int
   model: str
   temperature: float
   system_prompt: str
@@ -588,7 +589,7 @@ def answer_with_selection(
         'model': None,
         'output_chars': len(fast or '')
       }, prompt_idx=prompt_idx, prompt_text=user_input)
-      return fast, SelectionResult(model='', temperature=0.0, system_prompt='', reason='fast_path:math_expression')
+      return fast, SelectionResult(prompt_idx=prompt_idx, model='', temperature=0.0, system_prompt='', reason='fast_path:math_expression')
 
   installed = get_installed_ollama_models(
     ttl_s=float(_env('MODEL_LIST_TTL_S', _env('ROUTER_MODELS_TTL_S', '5')) or '5')
@@ -596,6 +597,7 @@ def answer_with_selection(
 
   if force_model:
     selected = SelectionResult(
+      prompt_idx=prompt_idx,
       model=force_model,
       temperature=_select_temperature(intent, is_tool=_needs_tools(user_input)),
       system_prompt=_select_system_prompt(intent, is_tool=_needs_tools(user_input)),
@@ -631,6 +633,7 @@ def answer_with_selection(
     for m in by_size:
       _set_power_label(prompt_idx=prompt_idx, phase='tools.attempt', model=m, prompt_text=user_input)
       selected = SelectionResult(
+        prompt_idx=prompt_idx,
         model=m,
         temperature=_select_temperature(intent, is_tool=True),
         system_prompt=_select_system_prompt(intent, is_tool=True),
@@ -643,6 +646,7 @@ def answer_with_selection(
         _trace(trace_path, {'event': 'agent.select.tools.success', 'model': m, 'output_chars': len(out or ''), 'phase': 'tools.success'}, prompt_idx=prompt_idx, prompt_text=user_input)
         _trace(trace_path, {'event': 'agent.select.final', 'model': m, 'output_chars': len(out or '')}, prompt_idx=prompt_idx, prompt_text=user_input)
         return out, SelectionResult(
+          prompt_idx=prompt_idx,
           model=m,
           temperature=selected.temperature,
           system_prompt=selected.system_prompt,
@@ -704,7 +708,7 @@ def answer_with_selection(
   if not drafts:
     _set_power_label(prompt_idx=prompt_idx, phase='final', model='', prompt_text=user_input)
     _trace(trace_path, {'event': 'agent.select.final', 'model': '', 'output_chars': 0, 'phase': 'final', 'reason': 'all_drafts_failed'}, prompt_idx=prompt_idx, prompt_text=user_input)
-    return '', SelectionResult(model='', temperature=temp, system_prompt=sys_prompt, reason='all_drafts_failed')
+    return '', SelectionResult(prompt_idx=prompt_idx, model='', temperature=temp, system_prompt=sys_prompt, reason='all_drafts_failed')
 
   judge_temp = _clamp_temperature(_env('MODEL_SELECT_JUDGE_TEMP', '0.0'), 0.0)
   judge_timeout_s = float(_env('MODEL_SELECT_JUDGE_TIMEOUT_S', '90') or '90')
@@ -727,43 +731,77 @@ def answer_with_selection(
 
   for jm in judge_models[: max(len(judge_models), 1)]:
     _set_power_label(prompt_idx=prompt_idx, phase='judge', model=jm, prompt_text=user_input)
-    _trace(trace_path, {'event': 'agent.select.judge_attempt', 'phase': 'judge', 'judge_model': jm}, prompt_idx=prompt_idx, prompt_text=user_input)
-    rj = _invoke_chat_with_timeout(
-      model=jm,
-      temperature=judge_temp,
-      system_prompt='Return strict JSON only.',
-      chat_history=[],
-      user_input=judge_prompt,
-      timeout_s=judge_timeout_s
-    )
-    judged_duration_ms = int(rj.get('duration_ms') or 0)
-    if not rj.get('ok'):
+    for attempt in range(2):
+      system_prompt = 'Return strict JSON only.'
+      if attempt == 1:
+        system_prompt = '\n'.join([
+          'Return VALID JSON only.',
+          'No markdown, no prose.',
+          'winner MUST be an integer index that refers to one Answer_i.'
+        ])
+
       _trace(trace_path, {
-        'event': 'agent.select.judge_failed',
+        'event': 'agent.select.judge_attempt',
         'phase': 'judge',
         'judge_model': jm,
-        'duration_ms': judged_duration_ms,
-        'timed_out': bool(rj.get('timed_out')),
-        'error': str(rj.get('error') or '')
+        'attempt': attempt + 1
       }, prompt_idx=prompt_idx, prompt_text=user_input)
-      continue
 
-    judged_raw = str(rj.get('text') or '').strip()
-    parsed = _try_parse_judge_json(judged_raw)
-    if parsed is None:
-      _trace(trace_path, {
-        'event': 'agent.select.judge_failed',
-        'phase': 'judge',
-        'judge_model': jm,
-        'duration_ms': judged_duration_ms,
-        'timed_out': False,
-        'error': 'invalid_judge_json'
-      }, prompt_idx=prompt_idx, prompt_text=user_input)
-      continue
+      rj = _invoke_chat_with_timeout(
+        model=jm,
+        temperature=judge_temp,
+        system_prompt=system_prompt,
+        chat_history=[],
+        user_input=judge_prompt,
+        timeout_s=judge_timeout_s
+      )
+      judged_duration_ms = int(rj.get('duration_ms') or 0)
 
-    judged_parsed = parsed
-    judged_model_used = jm
-    break
+      if not rj.get('ok'):
+        _trace(trace_path, {
+          'event': 'agent.select.judge_failed',
+          'phase': 'judge',
+          'judge_model': jm,
+          'attempt': attempt + 1,
+          'duration_ms': judged_duration_ms,
+          'timed_out': bool(rj.get('timed_out')),
+          'error': str(rj.get('error') or '')
+        }, prompt_idx=prompt_idx, prompt_text=user_input)
+        break
+
+      judged_raw = str(rj.get('text') or '').strip()
+      parsed = _try_parse_judge_json(judged_raw)
+      if parsed is None:
+        _trace(trace_path, {
+          'event': 'agent.select.judge_failed',
+          'phase': 'judge',
+          'judge_model': jm,
+          'attempt': attempt + 1,
+          'duration_ms': judged_duration_ms,
+          'timed_out': False,
+          'error': 'invalid_judge_json'
+        }, prompt_idx=prompt_idx, prompt_text=user_input)
+        continue
+
+      winner = int(parsed.get('winner') or 0)
+      if winner < 0 or winner >= len(drafts):
+        _trace(trace_path, {
+          'event': 'agent.select.judge_failed',
+          'phase': 'judge',
+          'judge_model': jm,
+          'attempt': attempt + 1,
+          'duration_ms': judged_duration_ms,
+          'timed_out': False,
+          'error': 'winner_out_of_range'
+        }, prompt_idx=prompt_idx, prompt_text=user_input)
+        continue
+
+      judged_parsed = parsed
+      judged_model_used = jm
+      break
+
+    if judged_model_used:
+      break
 
   if not judged_model_used:
     # No judge succeeded: pick the best draft by format/quality heuristic.
@@ -783,7 +821,7 @@ def answer_with_selection(
       'reason': 'judge_all_failed_pick_best_draft'
     }, prompt_idx=prompt_idx, prompt_text=user_input)
     _trace(trace_path, {'event': 'agent.select.final', 'model': chosen_model, 'output_chars': len(output or ''), 'phase': 'final'}, prompt_idx=prompt_idx, prompt_text=user_input)
-    return output, SelectionResult(model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason='judge_all_failed_pick_best_draft')
+    return output, SelectionResult(prompt_idx=prompt_idx, model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason='judge_all_failed_pick_best_draft')
 
   winner = int(judged_parsed.get('winner') or 0)
   if winner < 0 or winner >= len(drafts):
@@ -829,7 +867,7 @@ def answer_with_selection(
   output = str(chosen.get('output') or '').strip()
   _set_power_label(prompt_idx=prompt_idx, phase='final', model=chosen_model, prompt_text=user_input)
   _trace(trace_path, {'event': 'agent.select.final', 'model': chosen_model, 'output_chars': len(output or ''), 'phase': 'final'}, prompt_idx=prompt_idx, prompt_text=user_input)
-  return output, SelectionResult(model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason=reason)
+  return output, SelectionResult(prompt_idx=prompt_idx, model=chosen_model, temperature=temp, system_prompt=sys_prompt, reason=reason)
 
 
 def _run_with_selected(

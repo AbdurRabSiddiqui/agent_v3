@@ -116,6 +116,7 @@ def main() -> int:
     )
     duration_ms = int((time.time() - start) * 1000)
     is_correct = _compare(pred, gold)
+    correct_int = 1 if is_correct else 0
     if is_correct:
       correct += 1
 
@@ -127,11 +128,13 @@ def main() -> int:
       append_jsonl(agent_trace_path, {
         'event': 'math500.item',
         'idx': idx,
+        'prompt_idx': int(getattr(selected, 'prompt_idx', idx + 1)),
         'model': selected.model,
         'temperature': selected.temperature,
         'reason': selected.reason,
         'duration_ms': duration_ms,
         'correct': bool(is_correct),
+        'correct_int': int(correct_int),
         'level': row.get('level'),
         'type': row.get('type')
       })
@@ -140,11 +143,13 @@ def main() -> int:
       append_jsonl(args.log_jsonl, {
         'event': 'math500.item',
         'idx': idx,
+        'prompt_idx': int(getattr(selected, 'prompt_idx', idx + 1)),
         'model': selected.model,
         'temperature': selected.temperature,
         'reason': selected.reason,
         'duration_ms': duration_ms,
         'correct': bool(is_correct),
+        'correct_int': int(correct_int),
         'level': row.get('level'),
         'type': row.get('type')
       })
