@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+.env
+.hf_cache/
+logs/
+models/
+*.joblib
+*.parquet
