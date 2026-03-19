@@ -1,0 +1,1 @@
+{"ts": 1772817428.1168416, "prompt_idx": 401, "phase": "draft_2", "phase_model": "deepseek-r1:32b", "prompt_preview": "You are solving a MATH-500 competition problem.\nThink privately; do NOT show steps, reasoning, or explanations.\nOutput ONLY the final answer in the form: \\boxed", "prompt_sha256": "a3281012b31a000f420b4c57e13f914114c316afe561f14d432af0c6a463b6d1"}
